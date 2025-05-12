@@ -1,10 +1,40 @@
 import sys
 import argparse
 from google.cloud import bigquery
+from typing import Dict
 
 
 def get_indent(level):
     return " " * (level * 4)
+
+
+def get_column_max_data_length(client, table) -> Dict[str, int]:
+    results = {}
+
+    for field in table.schema:
+        data_type = field.field_type
+
+        if data_type == "STRING":
+            sql = f"SELECT MAX(LENGTH()) FROM tableName.tableColumn"
+            query_job = client.query(sql)
+            results[field.name] = query_job.result()
+
+        elif data_type == "INTEGER":
+            sql = f"SELECT MAX(LENGTH()) FROM tableName.tableColumn"
+            query_job = client.query(sql)
+            results[field.name] = query_job.result()
+
+        elif data_type == "FLOAT":
+            sql = f"SELECT MAX(LENGTH()) FROM tableName.tableColumn"
+            query_job = client.query(sql)
+            results[field.name] = query_job.result()
+
+        elif data_type == "NUMERIC":
+            sql = f"SELECT MAX(LENGTH()) FROM tableName.tableColumn"
+            query_job = client.query(sql)
+            results[field.name] = query_job.result()
+
+    return results
 
 
 def process_field(field, current_level):
@@ -126,6 +156,8 @@ def bigquery_to_cobol(project_id: str, dataset_id: str, table_id: str, copybook_
         return f"Error: Could not retrieve table information for {project_id}.{dataset_id}.{table_id}. {e}"
 
     copybook_lines = [f"       01 {copybook_name.upper()}"]
+
+    column_max_data_length = get_column_max_data_length(table)
 
     for schema_field in table.schema:
         copybook_lines.extend(process_field(schema_field, 0))  # Start at level 0 for main fields
