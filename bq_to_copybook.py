@@ -1,205 +1,341 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Reads a BigQuery table schema and generates a COBOL
+Copybook representation.
+The generation function returns a string.
+The script prints this string to STDOUT when run.
+"""
+
 import sys
 import argparse
+import re
+from typing import List, Dict, Any, Tuple
 from google.cloud import bigquery
-from typing import Dict
+from google.cloud.exceptions import NotFound
+from google.cloud.bigquery import SchemaField, Table
+
+# --- CONFIGURABLE DEFAULTS ---
+# These can be overridden by command-line args
+DEFAULT_STRING_LEN = 256
+DEFAULT_INTEGER_PICS = "S9(18)"
+DEFAULT_FLOAT_PICS = "S9(18)V9(06)"
+DEFAULT_OCCURS_COUNT = 25
+# --- END DEFAULTS ---
+
+# --- HELPER FUNCTIONS ---
 
 
-def get_indent(level):
-    return " " * (level * 4)
-
-
-def get_column_max_data_length(client, table) -> Dict[str, int]:
-    results = {}
-
-    for field in table.schema:
-        data_type = field.field_type
-
-        if data_type == "STRING":
-            sql = f"SELECT MAX(LENGTH()) FROM tableName.tableColumn"
-            query_job = client.query(sql)
-            results[field.name] = query_job.result()
-
-        elif data_type == "INTEGER":
-            sql = f"SELECT MAX(LENGTH()) FROM tableName.tableColumn"
-            query_job = client.query(sql)
-            results[field.name] = query_job.result()
-
-        elif data_type == "FLOAT":
-            sql = f"SELECT MAX(LENGTH()) FROM tableName.tableColumn"
-            query_job = client.query(sql)
-            results[field.name] = query_job.result()
-
-        elif data_type == "NUMERIC":
-            sql = f"SELECT MAX(LENGTH()) FROM tableName.tableColumn"
-            query_job = client.query(sql)
-            results[field.name] = query_job.result()
-
-    return results
-
-
-def process_field(field, current_level):
-    cobol_lines = []
-    field_name_cobol = field.name.replace("_", "-").upper()
-    data_type = field.field_type
-    mode = field.mode
-
-    # Determine the level number for the current field
-    field_level = current_level + 5
-
-    if mode == "REPEATED":
-        # For repeated fields, create a group item with OCCURS
-        cobol_lines.append(f"{get_indent(current_level)}   10 {field_name_cobol}-COUNT PIC S9(09) COMP.")
-        cobol_lines.append(
-            f"{get_indent(current_level)}   10 {field_name_cobol} OCCURS 999999 TIMES DEPENDING ON {field_name_cobol}-COUNT."
-        )
-        # Recurse for the actual repeated item's structure
-        # BigQuery repeated fields contain the actual type definition within them
-        # For a simple type (like ARRAY<STRING>), the field.fields list will have one entry
-        if field.fields:
-            # Handle nested structures within repeated fields
-            cobol_lines.extend(process_field(field.fields[0], current_level + 1))  # Increment level for items within OCCURS
-        else:
-            # Fallback for simpler repeated types if field.fields is empty (shouldn't happen for basic types)
-            # This case might need refinement based on specific repeated types
-            cobol_lines.append(
-                f"{get_indent(current_level + 1)}   {field_level} {field_name_cobol}-ITEM PIC X(256)."
-            )  # Default
-
-    elif data_type == "RECORD":
-        # For RECORD types, create a group item and process its subfields
-        cobol_lines.append(f"{get_indent(current_level)}   {field_level} {field_name_cobol}.")
-        for sub_field in field.fields:
-            cobol_lines.extend(process_field(sub_field, current_level + 1))  # Increment level for subfields
-    else:
-        # Handle primitive types
-        picture_clause = ""
-        usage_clause = ""
-
-        if data_type == "STRING":
-            # Use max_length if available, otherwise a reasonable default
-            length = field.max_length if field.max_length is not None else 256
-            picture_clause = f"PIC X({length})"
-        elif data_type == "INTEGER":
-            # BigQuery INTEGER is INT64. S9(18) can hold values up to 999,999,999,999,999,999
-            # COMP-3 (Packed Decimal) is a common choice for integers in COBOL
-            picture_clause = "PIC S9(18)"
-            usage_clause = "COMP-3"
-        elif data_type == "FLOAT":
-            # BigQuery FLOAT is FLOAT64 (double-precision).
-            # Representing arbitrary precision floats accurately in fixed-point COBOL is hard.
-            # Using packed decimal with a reasonable precision/scale as a common compromise.
-            # You might need to adjust this based on expected precision.
-            # Here, we assume 9 integer digits and 9 decimal digits.
-            picture_clause = "PIC S9(9)V9(9)"
-            usage_clause = "COMP-3"
-        elif data_type == "NUMERIC":
-            # BigQuery NUMERIC: 38 digits of precision, 9 digits of scale.
-            # We use precision and scale from the schema.
-            integer_digits = field.precision - field.scale if field.precision is not None and field.scale is not None else 29
-            decimal_digits = field.scale if field.scale is not None else 9
-            picture_clause = f"PIC S9({integer_digits})V9({decimal_digits})"
-            usage_clause = "COMP-3"
-        elif data_type == "BIGNUMERIC":
-            # BigQuery BIGNUMERIC: 76.76 digits of precision, 38 digits of scale.
-            # Similar approach as NUMERIC, but for larger values.
-            integer_digits = field.precision - field.scale if field.precision is not None and field.scale is not None else 38
-            decimal_digits = field.scale if field.scale is not None else 38
-            picture_clause = f"PIC S9({integer_digits})V9({decimal_digits})"
-            usage_clause = "COMP-3"
-        elif data_type == "BOOLEAN":
-            picture_clause = "PIC X(1)"  # 'T' for True, 'F' for False
-        elif data_type == "BYTES":
-            # Use max_length if available, otherwise a reasonable default
-            length = field.max_length if field.max_length is not None else 256
-            picture_clause = f"PIC X({length})"
-        elif data_type == "DATE":
-            picture_clause = "PIC X(10)"  # YYYY-MM-DD
-        elif data_type == "DATETIME":
-            picture_clause = "PIC X(26)"  # YYYY-MM-DD HH:MM:SS.FFFFFF
-        elif data_type == "TIME":
-            picture_clause = "PIC X(8)"  # HH:MM:SS
-        elif data_type == "TIMESTAMP":
-            picture_clause = "PIC X(30)"  # YYYY-MM-DD HH:MM:SS.FFFFFF UTC. Often stored as epoch in COBOL, but X(30) is a safer default for string representation.
-        else:
-            # Fallback for unhandled types
-            picture_clause = "PIC X(256)"
-            # Optional: Add a comment for unknown types
-            cobol_lines.append(f"{get_indent(current_level)}* WARNING: UNKNOWN BIGQUERY TYPE '{data_type}' MAPPED TO X(256)")
-
-        cobol_lines.append(
-            f"{get_indent(current_level)}   {field_level} {field_name_cobol} {picture_clause} {usage_clause}.".strip()
-        )
-
-    return cobol_lines
-
-
-def bigquery_to_cobol(project_id: str, dataset_id: str, table_id: str, copybook_name: str = "TABLE-RECORD."):
+def bq_to_cobol_name(bq_name: str) -> str:
     """
-    Generates a COBOL copybook for a given BigQuery table, including
-    string field lengths and numeric field scale and precision.
+    Converts BigQuery field name to a COBOL-friendly name.
+     - Uppercase
+     - Underscore to Hyphen
+     - Truncate to 30 Chars
+     - Remove other invalid chars
+    """
+    if not bq_name:
+        return "FILLER"
+    # Replace underscores, convert to upper,
+    cobol_name = re.sub(r"[^A-Z0-9-]", "-", bq_name.upper().replace("_", "-"))
+    # Ensure it doesn't start/end with a hyphen
+    cobol_name = cobol_name.strip("-")
+    if not cobol_name:
+        return "FILLER"
+
+    return cobol_name[:30]
+
+
+# def get_field_length(args, field: SchemaField) -> int:
+#     client = bigquery.Client(project=args.project_id)
+#     table_ref = client.dataset(args.dataset_id).table(args.table_id)
+#     table = client.get_table(table_ref)
+#     print("LLEGOA CA")
+#     res = client.query(f"SELECT * FROM {table_ref.dataset_id}")
+#     return 1
+
+
+def get_numeric_digit_counts(args, field: SchemaField) -> Tuple[int, int]:
+    """
+    Gets the maximum number of digits in the integer part and the maximum
+    number of digits in the decimal part for a specified BigQuery NUMERIC
+    or BIGNUMERIC column.
 
     Args:
-        project_id: The ID of your Google Cloud project.
-        dataset_id: The ID of the BigQuery dataset.
-        table_id: The ID of the BigQuery table.
-        copybook_name: The name to use for the top-level record in the copybook.
+        args: An object with attributes project_id, dataset_id, and table_id.
+        field: A BigQuery SchemaField object representing the numeric column to analyze.
+               Expected field types: 'NUMERIC', 'BIGNUMERIC'.
 
     Returns:
-        A string containing the COBOL copybook definition.
+        A tuple (max_integer_digits, max_decimal_digits).
+        Returns (0, 0) if the column is empty, all values are NULL, or an error occurs.
     """
-    client = bigquery.Client(project=project_id)
-    table_ref = client.dataset(dataset_id).table(table_id)
+    client = bigquery.Client(project=args.project_id)
+    table_ref = client.dataset(args.dataset_id).table(args.table_id)
+
+    query = f"""
+    SELECT max(char_length(cast(trunc({field.name}) as string))) AS max_integer_digits,
+max(char_length(cast({field.name}-trunc({field.name}) as string))) as max_decimal_digits
+ FROM `{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}`
+"""
+
+    query_job = client.query(query)
+    result = query_job.result()  # Waits for the job to complete.
+
+    for row in result:
+        max_integer_digits = row["max_integer_digits"] if row["max_integer_digits"] is not None else 0
+        max_decimal_digits = row["max_decimal_digits"] if row["max_decimal_digits"] is not None else 0
+        return (max_integer_digits, max_decimal_digits)
+
+
+def get_field_length(args, field: SchemaField, sql: str = None) -> int:
+    """
+    Gets the maximum length of a string in a specified BigQuery column.
+
+    Args:
+        args: An object with attributes project_id, dataset_id, and table_id.
+        field: A BigQuery SchemaField object representing the column to analyze.
+
+    Returns:
+        The maximum string length found in the column, or 0 if the column
+        is empty or does not contain strings.
+    """
+    client = bigquery.Client(project=args.project_id)
+    table_ref = client.dataset(args.dataset_id).table(args.table_id)
+
+    # Construct the SQL query to find the maximum length of the string column
+    # We use COALESCE to handle NULL values, treating their length as 0.
+    query = (
+        sql
+        or f"""
+        SELECT MAX(LENGTH(CAST({field.name} AS STRING)))
+        FROM `{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}`
+        WHERE {field.name} IS NOT NULL
+    """
+    )
 
     try:
-        table = client.get_table(table_ref)
+        query_job = client.query(query)
+        result = query_job.result()  # Waits for the job to complete.
+
+        for row in result:
+            max_length = row[0]
+            if max_length is not None:
+                print(f"EL MAX LENGTH ES {field.name=} {max_length=}")
+                return max_length
+            else:
+                return 0  # Column is empty or all values are NULL
+
     except Exception as e:
-        return f"Error: Could not retrieve table information for {project_id}.{dataset_id}.{table_id}. {e}"
+        print(f"An error occurred: {e}")
+        return 0  # Or raise the exception, depending on desired error handling
 
-    copybook_lines = [f"       01 {copybook_name.upper()}"]
-
-    column_max_data_length = get_column_max_data_length(table)
-
-    for schema_field in table.schema:
-        copybook_lines.extend(process_field(schema_field, 0))  # Start at level 0 for main fields
-
-    return "\n".join(copybook_lines)
+    return 0  # Default return if no rows are processed (e.g., empty table)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate a COBOL copybook from a BigQuery table schema.")
-    parser.add_argument("project_id", help="The ID of your Google Cloud project.")
-    parser.add_argument("dataset_id", help="The ID of the BigQuery dataset.")
-    parser.add_argument("table_id", help="The ID of the BigQuery table.")
+def get_integer_max_length(args, field: SchemaField) -> int:
+    client = bigquery.Client(project=args.project_id)
+    table_ref = client.dataset(args.dataset_id).table(args.table_id)
+
+    query = f"""
+        SELECT
+            MAX(CHAR_LENGTH(FORMAT('%d', {field.name}))) AS max_integer_length
+        FROM `{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}`
+        WHERE {field.name} IS NOT NULL
+    """
+
+    query_job = client.query(query)
+    result = query_job.result()  # Waits for the job to complete.
+
+    for row in result:
+        max_length = row["max_integer_length"]
+        return max_length
+
+
+def bq_type_to_pic(args, field: SchemaField, config: Dict[str, Any]) -> str:
+    """
+    Maps a BigQuery SchemaField to a COBOL PIC clause string.
+    Returns None for STRUCT/RECORD types, as they are handled
+    via recursion.
+    Uses config dictionary for defaults.
+    """
+    f_type = field.field_type
+
+    # --- Precise Types ---
+    if f_type in ("NUMERIC", "BIGNUMERIC", "FLOAT", "FLOAT64"):
+        int_size, decimal_size = get_numeric_digit_counts(args, field)
+        return f"S9({int_size})V9({decimal_size})"
+
+    # --- Standard Types (using defaults if needed) ---
+    elif f_type in ("INTEGER", "INT64"):
+        length = get_integer_max_length(args, field)
+        print(f"EL LENGTH PARA {field.name=} {length=}")
+        return f"X({length})"
+
+    elif f_type == "BOOLEAN":
+        return "X(1)"  # For 'T'/'F'
+
+    elif f_type == "STRING":
+        length = get_field_length(args, field) or 256
+        return f"X({length})"
+
+    elif f_type == "BYTES":
+        sql = f"SELECT MAX(BYTE_LENGTH({field.name})) FROM `lhoet-joonix-proj.all_data_types_dataset.all_types_table`"
+        length = get_field_length(args, field, sql) or 256
+        return f"X({length})"
+
+    elif f_type == "GEOGRAPHY":
+        length = field.max_length if field.max_length else config["default_string_len"]
+        return f"X({length})"
+
+    elif f_type == "TIMESTAMP":
+        return "X(26)"  # YYYY-MM-DDTHH:MM:SS.ffffff
+
+    elif f_type == "DATE":
+        return "X(10)"  # YYYY-MM-DD
+
+    elif f_type == "DATETIME":
+        return "X(19)"  # YYYY-MM-DDTHH:MM:SS
+
+    elif f_type == "TIME":
+        return "X(12)"  # HH:MM:SS.ffffff
+
+    else:
+        # Fallback for unknown/new types
+        print(f"WARNING: Unknown BQ Type '{f_type}' for field '{field.name}'. Using default PIC X(256).", file=sys.stderr)
+        return f"X({config['default_string_len']})"
+
+
+def _generate_copybook_lines(args, schema: List[SchemaField], level: int, config: Dict[str, Any]) -> List[str]:
+    """
+    Recursively generates copybook lines for a schema.
+    Returns a List of strings (the copybook lines).
+    """
+    lines = []
+    level_str = f"{level:02d}"
+    default_occurs = config["default_occurs"]
+
+    for field in schema:
+        cobol_name = bq_to_cobol_name(field.name)
+        pic_clause = bq_type_to_pic(args, field, config)
+
+        occurs_clause = ""
+        if field.mode == "REPEATED":
+            occurs_clause = f" OCCURS {default_occurs} TIMES"
+
+        # Margin A (level 01-77) starts in col 8.
+        # Margin B (statements) starts in col 12.
+        if level_str == "01":
+            line_prefix = f"{' ' * 7}{level_str}  {cobol_name}"
+        elif level_str:
+            line_prefix = f"{' ' * 12}{level_str}  {cobol_name}"
+
+        if pic_clause:
+            # It's a simple Field
+            # Pad name to align PIC clauses, e.g., at column 40
+            line = f"{line_prefix:<40} PIC {pic_clause}{occurs_clause}."
+            lines.append(line)
+        elif field.field_type in ("STRUCT", "RECORD"):
+            # It's a Structure (Group Item)
+            line = f"{line_prefix}{occurs_clause}."
+            lines.append(line)
+            # Recurse and add results
+            nested_lines = _generate_copybook_lines(args, field.fields, level + 5, config)
+            lines.extend(nested_lines)
+        else:
+            # Should not happen
+            warning_line = f"*{' ' * 6}WARNING: SKIPPED field {field.name} (Type: {field.field_type})"
+            lines.append(warning_line)
+            print(warning_line, file=sys.stderr)
+
+    return lines
+
+
+# --- MAIN GENERATION FUNCTION ---
+
+
+def generate_copybook_string(args, table: Table, record_name: str, config: Dict[str, Any]) -> str:
+    """
+    Takes a BigQuery Table object and configuration,
+    returns the full Copybook as a string.
+    """
+
+    lines = []
+    # Header / Comments
+    header = f"""       ******************************************************************
+       * COBOL COPYBOOK GENERATED FROM 
+       * BQ TABLE: {table.project}.{table.dataset_id}.{table.table_id}
+       *
+       * IMPORTANT:
+       * - Verify PIC X(n) lengths. Defaults are used if
+       * max_length is not specified in BQ schema.
+       * - REPEATED fields use a FIXED OCCURS {config["default_occurs"]} clause.
+       * Ensure this count is sufficient for processing.
+       * - NUMERIC types are generated as COMP-3 (Packed Decimal).
+       * - INTEGER types are generated as COMP (Binary).
+       * - Adjust USAGE (COMP, COMP-3, DISPLAY) as needed.
+       ******************************************************************"""
+    lines.append(header)
+
+    # 01 Level
+    lines.append(f"{' ' * 7}01  {bq_to_cobol_name(record_name)}.")
+
+    # 05+ Levels (Child Fields)
+    field_lines = _generate_copybook_lines(args, table.schema, 5, config)
+    lines.extend(field_lines)
+
+    return "\n".join(lines)
+
+
+# --- COMMAND LINE EXECUTION ---
+
+
+def run_cli():
+    """Parses CLI args, fetches schema, generates copybook, prints to stdout."""
+
+    parser = argparse.ArgumentParser(
+        description="Convert BigQuery Table Schema to COBOL Copybook (to STDOUT).",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument("project_id", help="Google Cloud Project ID.", default="lhoet-joonix-proj")
+    parser.add_argument("dataset_id", help="BigQuery Dataset ID.", default="all_data_types_dataset")
+    parser.add_argument("table_id", help="BigQuery Table ID.", default="all_types_table")
+    parser.add_argument("--record-name", help="Top-level (01) Record Name for the Copybook.", default="BQ-RECORD")
     parser.add_argument(
-        "--copybook_name",
-        default="TABLE-RECORD.",
-        help="The name to use for the top-level record in the copybook (default: TABLE-RECORD.).",
+        "--default-occurs",
+        type=int,
+        default=DEFAULT_OCCURS_COUNT,
+        help=f"Fixed OCCURS count to use for REPEATED fields.\n(Default: {DEFAULT_OCCURS_COUNT})",
+    )
+    parser.add_argument(
+        "--default-string-len",
+        type=int,
+        default=DEFAULT_STRING_LEN,
+        help=f"PIC X(n) length to use for STRING/BYTES if not defined in BQ Schema.\n(Default: {DEFAULT_STRING_LEN})",
     )
 
     args = parser.parse_args()
 
-    copybook_output = bigquery_to_cobol(args.project_id, args.dataset_id, args.table_id, args.copybook_name)
+    # Bundle config to pass down
+    config = {"default_occurs": args.default_occurs, "default_string_len": args.default_string_len}
 
-    if "Error:" in copybook_output:
-        print(copybook_output)
-    else:
-        print("Generated COBOL Copybook:")
-        print(copybook_output)
+    try:
+        client = bigquery.Client(project=args.project_id)
+        table_ref = client.dataset(args.dataset_id).table(args.table_id)
+        table = client.get_table(table_ref)
 
-# Example usage with a hypothetical table:
-# Assume a table named my_dataset.my_table in my-project
-# with columns:
-# - string_col STRING (max_length=50)
-# - int_col INTEGER
-# - float_col FLOAT
-# - numeric_col NUMERIC (precision=20, scale=5)
-# - bignumeric_col BIGNUMERIC (precision=50, scale=20)
-# - date_col DATE
-# - record_col RECORD
-#   - nested_string STRING (max_length=10)
-#   - nested_int INTEGER
-# - repeated_string_col ARRAY<STRING> (max_length=20)
+    except NotFound:
+        print(f"\nERROR: Table not found: {args.project_id}.{args.dataset_id}.{args.table_id}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nERROR: Failed to get table schema. Check credentials and IDs. \n {e}", file=sys.stderr)
+        sys.exit(1)
 
-# You would run:
-# python your_script_name.py projId datasetId tableId
-# And replace the placeholder variables above.
+    # --- Generate and Print ---
+    copybook_output_string = generate_copybook_string(args, table, args.record_name, config)
+
+    print(copybook_output_string)
+
+
+if __name__ == "__main__":
+    run_cli()
