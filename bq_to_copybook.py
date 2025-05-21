@@ -73,9 +73,9 @@ def get_numeric_digit_counts(args, field: SchemaField) -> Tuple[int, int]:
     client = bigquery.Client(project=args.project_id)
     table_ref = client.dataset(args.dataset_id).table(args.table_id)
 
-    query = f"""
-    SELECT max(char_length(cast(trunc({field.name}) as string))) AS max_integer_digits,
-max(char_length(cast({field.name}-trunc({field.name}) as string))) as max_decimal_digits
+    query = f""" SELECT 
+    char_length(cast(trunc(max({field.name})) as string)) AS max_integer_digits,
+    max(char_length(cast({field.name}-trunc({field.name}) as string))) as max_decimal_digits
  FROM `{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}`
 """
 
@@ -121,7 +121,6 @@ def get_field_length(args, field: SchemaField, sql: str = None) -> int:
         for row in result:
             max_length = row[0]
             if max_length is not None:
-                print(f"EL MAX LENGTH ES {field.name=} {max_length=}")
                 return max_length
             else:
                 return 0  # Column is empty or all values are NULL
@@ -138,11 +137,10 @@ def get_integer_max_length(args, field: SchemaField) -> int:
     table_ref = client.dataset(args.dataset_id).table(args.table_id)
 
     query = f"""
-        SELECT
-            MAX(CHAR_LENGTH(FORMAT('%d', {field.name}))) AS max_integer_length
-        FROM `{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}`
-        WHERE {field.name} IS NOT NULL
-    """
+        SELECT CHAR_LENGTH(FORMAT('%d', 
+            (SELECT MAX({field.name}) FROM {table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id})
+            )) AS max_integer_length
+        """
 
     query_job = client.query(query)
     result = query_job.result()  # Waits for the job to complete.
@@ -169,11 +167,10 @@ def bq_type_to_pic(args, field: SchemaField, config: Dict[str, Any]) -> str:
     # --- Standard Types (using defaults if needed) ---
     elif f_type in ("INTEGER", "INT64"):
         length = get_integer_max_length(args, field)
-        print(f"EL LENGTH PARA {field.name=} {length=}")
         return f"X({length})"
 
     elif f_type == "BOOLEAN":
-        return "X(1)"  # For 'T'/'F'
+        return "X(1)"
 
     elif f_type == "STRING":
         length = get_field_length(args, field) or 256
