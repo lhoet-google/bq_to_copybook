@@ -162,12 +162,12 @@ def bq_type_to_pic(args, field: SchemaField, config: Dict[str, Any]) -> str:
     # --- Precise Types ---
     if f_type in ("NUMERIC", "BIGNUMERIC", "FLOAT", "FLOAT64"):
         int_size, decimal_size = get_numeric_digit_counts(args, field)
-        return f"S9({int_size})V9({decimal_size})"
+        return f"S9({int_size})V9({decimal_size}) COMP-3"
 
     # --- Standard Types (using defaults if needed) ---
     elif f_type in ("INTEGER", "INT64"):
         length = get_integer_max_length(args, field)
-        return f"X({length})"
+        return f"9({length})"
 
     elif f_type == "BOOLEAN":
         return "X(1)"
