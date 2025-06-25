@@ -12,7 +12,7 @@ import argparse
 import re
 from typing import List, Dict, Any, Tuple
 from google.cloud import bigquery
-from google.cloud.exceptions import NotFound
+from google.cloud.exceptions import BadRequest, NotFound
 from google.cloud.bigquery import SchemaField, Table
 
 # --- CONFIGURABLE DEFAULTS ---
@@ -21,6 +21,7 @@ DEFAULT_STRING_LEN = 256
 DEFAULT_INTEGER_PICS = "S9(18)"
 DEFAULT_FLOAT_PICS = "S9(18)V9(06)"
 DEFAULT_OCCURS_COUNT = 25
+DEFAULT_INTEGER_LENGTH = 18
 # --- END DEFAULTS ---
 
 # --- HELPER FUNCTIONS ---
@@ -143,10 +144,38 @@ def get_integer_max_length(args, field: SchemaField) -> int:
         """
 
     query_job = client.query(query)
-    result = query_job.result()  # Waits for the job to complete.
+    try:
+        result = query_job.result()  # Waits for the job to complete.
+    except BadRequest as e:
+        if "invalidQuery" in str(e):
+            return DEFAULT_INTEGER_LENGTH
+        raise e
 
     for row in result:
         max_length = row["max_integer_length"]
+        return max_length
+
+
+def get_array_max_length(args, field: SchemaField) -> int:
+    client = bigquery.Client(project=args.project_id)
+    table_ref = client.dataset(args.dataset_id).table(args.table_id)
+
+    query = f"""
+             SELECT
+             MAX(ARRAY_LENGTH({field.name})) AS max_array_length
+             FROM {table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id};
+        """
+
+    query_job = client.query(query)
+    try:
+        result = query_job.result()  # Waits for the job to complete.
+    except BadRequest as e:
+        if "invalidQuery" in str(e):
+            return DEFAULT_INTEGER_LENGTH
+        raise e
+
+    for row in result:
+        max_length = row["max_array_length"]
         return max_length
 
 
@@ -177,7 +206,7 @@ def bq_type_to_pic(args, field: SchemaField, config: Dict[str, Any]) -> str:
         return f"X({length})"
 
     elif f_type == "BYTES":
-        sql = f"SELECT MAX(BYTE_LENGTH({field.name})) FROM `lhoet-joonix-proj.all_data_types_dataset.all_types_table`"
+        sql = f"SELECT MAX(BYTE_LENGTH({field.name})) FROM `{args.project_id}.{args.dataset_id}.{args.table_id}`"
         length = get_field_length(args, field, sql) or 256
         return f"X({length})"
 
@@ -217,27 +246,26 @@ def _generate_copybook_lines(args, schema: List[SchemaField], level: int, config
         pic_clause = bq_type_to_pic(args, field, config)
 
         occurs_clause = ""
-        if field.mode == "REPEATED":
-            occurs_clause = f" OCCURS {default_occurs} TIMES"
+        if field.mode == "REPEATED" or field.field_type == "RECORD":
+            occurs_times = get_array_max_length(args, field)
+            occurs_clause = f" OCCURS {occurs_times} TIMES"
 
-        # Margin A (level 01-77) starts in col 8.
-        # Margin B (statements) starts in col 12.
+        indentation_per_level = 7
         if level_str == "01":
-            line_prefix = f"{' ' * 7}{level_str}  {cobol_name}"
+            line_prefix = f"{' ' * indentation_per_level}{level_str}  {cobol_name}"
         elif level_str:
-            line_prefix = f"{' ' * 12}{level_str}  {cobol_name}"
+            space_per_level = 5
+            num_levels = (level / space_per_level) + 1
+            indentation = int(indentation_per_level * num_levels)
+            line_prefix = f"{' ' * indentation}{level_str}  {cobol_name}"
 
-        if pic_clause:
-            # It's a simple Field
-            # Pad name to align PIC clauses, e.g., at column 40
+        if pic_clause and field.field_type != "RECORD":
             line = f"{line_prefix:<40} PIC {pic_clause}{occurs_clause}."
             lines.append(line)
         elif field.field_type in ("STRUCT", "RECORD"):
-            # It's a Structure (Group Item)
-            line = f"{line_prefix}{occurs_clause}."
+            line = f"{line_prefix} "
             lines.append(line)
-            # Recurse and add results
-            nested_lines = _generate_copybook_lines(args, field.fields, level + 5, config)
+            nested_lines = _generate_copybook_lines(args, list(field.fields), level + 5, config)
             lines.extend(nested_lines)
         else:
             # Should not happen
@@ -294,9 +322,9 @@ def run_cli():
         description="Convert BigQuery Table Schema to COBOL Copybook (to STDOUT).",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("project_id", help="Google Cloud Project ID.", default="lhoet-joonix-proj")
-    parser.add_argument("dataset_id", help="BigQuery Dataset ID.", default="all_data_types_dataset")
-    parser.add_argument("table_id", help="BigQuery Table ID.", default="all_types_table")
+    parser.add_argument("project_id", help="Google Cloud Project ID.")
+    parser.add_argument("dataset_id", help="BigQuery Dataset ID.")
+    parser.add_argument("table_id", help="BigQuery Table ID.")
     parser.add_argument("--record-name", help="Top-level (01) Record Name for the Copybook.", default="BQ-RECORD")
     parser.add_argument(
         "--default-occurs",
