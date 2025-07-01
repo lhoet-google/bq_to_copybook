@@ -246,7 +246,7 @@ def _generate_copybook_lines(args, schema: List[SchemaField], level: int, config
 
         occurs_clause = ""
         if field.mode == "REPEATED" or field.field_type == "RECORD":
-            occurs_times = get_array_max_length(args, field)
+            occurs_times = vars(args).get("default_occurs", None) or get_array_max_length(args, field)
             occurs_clause = f" OCCURS {occurs_times} TIMES"
 
         indentation_per_level = 7
@@ -330,8 +330,8 @@ def run_cli():
     parser.add_argument(
         "--default-occurs",
         type=int,
-        default=DEFAULT_OCCURS_COUNT,
-        help=f"Fixed OCCURS count to use for REPEATED fields.\n(Default: {DEFAULT_OCCURS_COUNT})",
+        default=None,
+        help=f"Fixed OCCURS count to use for REPEATED fields. If not provided, it will be generated dynamically",
     )
     parser.add_argument(
         "--default-string-len",
