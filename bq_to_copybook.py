@@ -239,7 +239,6 @@ def _generate_copybook_lines(args, schema: List[SchemaField], level: int, config
     """
     lines = []
     level_str = f"{level:02d}"
-    default_occurs = config["default_occurs"]
 
     for field in schema:
         cobol_name = bq_to_cobol_name(field.name)
@@ -264,6 +263,8 @@ def _generate_copybook_lines(args, schema: List[SchemaField], level: int, config
             lines.append(line)
         elif field.field_type in ("STRUCT", "RECORD"):
             line = f"{line_prefix} "
+            if occurs_clause:
+                line += "    " + occurs_clause
             lines.append(line)
             nested_lines = _generate_copybook_lines(args, list(field.fields), level + 5, config)
             lines.extend(nested_lines)
